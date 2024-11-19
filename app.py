@@ -17,7 +17,7 @@ class HARTPipeline():
     model_path: str = "mit-han-lab/hart-0.7b-1024px"
     encoder_path: str = "mit-han-lab/Qwen2-VL-1.5B-Instruct"
     device = torch.device('cuda')
-    dtype = torch.bfloat16
+    dtype = torch.float16
     model: HARTForT2I = None
     encoder = None
     tokenizer = None
@@ -38,16 +38,17 @@ class HARTPipeline():
             subfolder='llm',
             torch_dtype=self.dtype,
             vae_path=self.model_path,
-        ).to(self.device)
+        )
         self.model.eval()
         self.tokenizer = AutoTokenizer.from_pretrained(self.encoder_path)
-        self.encoder = AutoModel.from_pretrained(self.encoder_path, torch_dtype=self.dtype).to(self.device)
+        self.encoder = AutoModel.from_pretrained(self.encoder_path, torch_dtype=self.dtype)
         self.encoder.eval()
 
 
-    def encode(self, prompt: str|list[str], max_tokens: int = 300, llm: bool = True):
+    def encode(self, prompt: str|list[str], max_tokens: int = 300, llm: bool = True, batch: int = 1):
         from hart.utils import encode_prompts, llm_system_prompt
-        prompts = [prompt] if isinstance(prompt, str) else prompt
+        prompts = batch * [prompt] if isinstance(prompt, str) else prompt
+        pipe.encoder.to(self.device)
         (
             _context_tokens,
             context_mask,
@@ -61,6 +62,7 @@ class HARTPipeline():
             system_prompt=llm_system_prompt,
             use_llm_system_prompt=llm,
         )
+        pipe.encoder.to('cpu')
         return context_mask, context_ids, context_tensor
 
     def seed(self, seed: int):
@@ -83,6 +85,7 @@ class HARTPipeline():
                  seed: int = -1,
                 ):
         seed = self.seed(seed)
+        pipe.model.to(self.device)
         samples = pipe.model.autoregressive_infer_cfg(
             B=context_tensor.size(0), # batch size comes from number of prompts
             label_B=context_tensor,
@@ -95,6 +98,7 @@ class HARTPipeline():
             context_position_ids=context_ids,
             context_mask=context_mask,
         )
+        pipe.model.to('cpu')
         return samples
 
     def sample(self, samples: torch.Tensor):
@@ -114,6 +118,7 @@ def mem():
 def generate(
     prompt: str,
     seed: int = 0,
+    batch: int = 1,
     guidance: float = 4.5,
     smooth: bool = True,
     llm: bool = True,
@@ -130,15 +135,17 @@ def generate(
         pipe = HARTPipeline()
         t1 = time.time()
         pprint(f'load: model="{pipe.model_path}" cls={pipe.model.__class__.__name__} encoder="{pipe.encoder_path}" cls={pipe.encoder.__class__.__name__} device={pipe.device} dtype={pipe.dtype} memory={mem()} time={t1-t0:.3f}')
-    pprint(f'generate: seed={seed} guidance={guidance} smooth={smooth} llm={llm} iterations={iterations} top_k={top_k} top_p={top_p} max_tokens={max_tokens} prompt="{prompt}" ')
+    pprint(f'request: seed={seed} batch={batch} guidance={guidance} smooth={smooth} llm={llm} iterations={iterations} top_k={top_k} top_p={top_p} max_tokens={max_tokens} prompt="{prompt}" ')
     with torch.inference_mode(), torch.autocast("cuda", enabled=True, dtype=pipe.dtype, cache_enabled=False):
         t0 = time.time()
         context_mask, context_ids, context_tensor = pipe.encode(
             prompt,
             max_tokens,
             llm,
+            batch,
         )
         t1 = time.time()
+        pprint(f'encode: context={context_tensor.shape} memory={mem()} time={t1-t0:.3f}')
         samples = pipe.generate(
             context_tensor=context_tensor,
             context_ids=context_ids,
@@ -152,7 +159,7 @@ def generate(
         )
         t2 = time.time()
         images = pipe.sample(samples)
-    pprint(f'harp: encode={t1-t0:.3f} generate={t2-t1:.3f} images: {images} memory={mem()}')
+    pprint(f'generate: images={images} memory={mem()} time={t2-t1:.3f} ')
     return images
 
 
@@ -171,15 +178,16 @@ if __name__ == "__main__":
                     seed = gr.Number(label="Seed", minimum=-1, maximum=np.iinfo(np.int32).max, step=1, value=-1)
                     top_k = gr.Number(label="Top-K", minimum=0, maximum=2000, step=1, value=600)
                     top_p = gr.Number(label="Top-P", minimum=0, maximum=1, step=0.01, value=0)
+                    batch = gr.Slider(label="Batch size", minimum=1, maximum=16, step=1, value=1)
                     guidance = gr.Slider(label="Guidance Scale", minimum=0.1, maximum=20, step=0.1, value=4.5)
                     iterations = gr.Slider(label="Iterations", minimum=1, maximum=99, step=1, value=1)
             with gr.Column(scale=4):
                 with gr.Row():
-                    result = gr.Gallery(label="Result", columns=1, show_label=False)
+                    result = gr.Gallery(label="Result", columns=2, show_label=False)
         gr.on(
             triggers=[prompt.submit, run_button.click],
             fn=generate,
-            inputs=[prompt, seed, guidance, smooth, llm, iterations, top_k, top_p], 
+            inputs=[prompt, seed, batch, guidance, smooth, llm, iterations, top_k, top_p], 
             outputs=[result],
             api_name="run",
         )
