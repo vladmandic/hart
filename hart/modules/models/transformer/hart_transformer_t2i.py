@@ -112,7 +112,7 @@ class HARTForT2I(PreTrainedModel):
             (mask_ratio_min - 1.0) / 0.25, 0, loc=1.0, scale=0.25
         )
 
-        vae_local = HARTAutoEncoderWithDisc.from_pretrained(vae_path).vae
+        vae_local = HARTAutoEncoderWithDisc.from_pretrained(vae_path, subfolder='tokenizer').vae
         vae_local = vae_local.cuda()
         vae_local.requires_grad_(False)
 
@@ -260,7 +260,6 @@ class HARTForT2I(PreTrainedModel):
         self.register_buffer(
             "attn_bias_for_masking", attn_bias_for_masking.contiguous()
         )
-        print(attn_bias_for_masking.shape)
 
         # 6. classifier head
         self.head_nm = AdaLNBeforeHead(self.C, self.D, norm_layer=norm_layer)
@@ -406,7 +405,7 @@ class HARTForT2I(PreTrainedModel):
             idx_Bl = sample_with_top_k_top_p_(
                 logits_BlV,
                 rng=rng,
-                top_k=(600 if si < 7 else 300),
+                top_k=top_k,
                 top_p=top_p,
                 num_samples=1,
             )[:, :, 0]
@@ -483,7 +482,7 @@ class HARTForT2I(PreTrainedModel):
             idx_Bl = sample_with_top_k_top_p_(
                 logits_BlV,
                 rng=rng,
-                top_k=(600 if si < 7 else 300),
+                top_k=top_k,
                 top_p=top_p,
                 num_samples=1,
             )[:, :, 0]
