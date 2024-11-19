@@ -1,0 +1,10 @@
+torch
+torchvision
+transformers
+tokenizers
+accelerate
+numpy==1.26.4
+gradio==4.44.1
+timm==0.9.12
+diffusers
+scipy

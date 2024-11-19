@@ -1,255 +1,186 @@
 #!/usr/bin/env python
+# credits: <https://github.com/mit-han-lab/hart>
 
-import argparse
-import copy
-import os
-import random
-import uuid
-
-import gradio as gr
+import time
 import numpy as np
-import spaces
 import torch
-from PIL import Image
-from transformers import (
-    AutoConfig,
-    AutoModel,
-    AutoModelForCausalLM,
-    AutoTokenizer,
-    HfArgumentParser,
-    set_seed,
-)
-
-from hart.modules.models.transformer import HARTForT2I
-from hart.utils import default_prompts, encode_prompts, llm_system_prompt, safety_check
-
-DESCRIPTION = (
-    """# HART: Efficient Visual Generation with Hybrid Autoregressive Transformer"""
-    + """\n[\\[Paper\\]](https://arxiv.org/abs/2410.10812) [\\[Project\\]](https://hanlab.mit.edu/projects/hart) [\\[GitHub\\]](https://github.com/mit-han-lab/hart)"""
-    + """\n<p>Note: We will replace unsafe prompts with a default prompt: \"A red heart.\"</p>"""
-)
-if not torch.cuda.is_available():
-    DESCRIPTION += "\n<p>Running on CPU 🥶 This demo may not work on CPU.</p>"
-
-MAX_SEED = np.iinfo(np.int32).max
-CACHE_EXAMPLES = torch.cuda.is_available() and os.getenv("CACHE_EXAMPLES", "0") == "1"
-MAX_IMAGE_SIZE = int(os.getenv("MAX_IMAGE_SIZE", "1024"))
-USE_TORCH_COMPILE = os.getenv("USE_TORCH_COMPILE", "0") == "1"
-ENABLE_CPU_OFFLOAD = os.getenv("ENABLE_CPU_OFFLOAD", "0") == "1"
-
-device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
-
-NUM_IMAGES_PER_PROMPT = 1
+from rich import print as pprint
+import gradio as gr
 
 
-def randomize_seed_fn(seed: int, randomize_seed: bool) -> int:
-    if randomize_seed:
-        seed = random.randint(0, MAX_SEED)
-    return seed
+pipe = None
 
 
-@spaces.GPU(enable_queue=True)
+class HARTPipeline():
+    from hart.modules.models.transformer import HARTForT2I # registers automodel handler
+
+    model_path: str = "mit-han-lab/hart-0.7b-1024px"
+    encoder_path: str = "mit-han-lab/Qwen2-VL-1.5B-Instruct"
+    device = torch.device('cuda')
+    dtype = torch.bfloat16
+    model: HARTForT2I = None
+    encoder = None
+    tokenizer = None
+
+    def __init__(self,
+                 model_path: str = None,
+                 encoder_path: str = None,
+                 device: torch.device = None,
+                 dtype: torch.dtype = None,
+                ):
+        from transformers import AutoModel, AutoTokenizer
+        self.device = device or self.device
+        self.dtype = dtype or self.dtype
+        self.model_path = model_path or self.model_path
+        self.encoder_path = encoder_path or self.encoder_path
+        self.model = AutoModel.from_pretrained(
+            self.model_path,
+            subfolder='llm',
+            torch_dtype=self.dtype,
+            vae_path=self.model_path,
+        ).to(self.device)
+        self.model.eval()
+        self.tokenizer = AutoTokenizer.from_pretrained(self.encoder_path)
+        self.encoder = AutoModel.from_pretrained(self.encoder_path, torch_dtype=self.dtype).to(self.device)
+        self.encoder.eval()
+
+
+    def encode(self, prompt: str|list[str], max_tokens: int = 300, llm: bool = True):
+        from hart.utils import encode_prompts, llm_system_prompt
+        prompts = [prompt] if isinstance(prompt, str) else prompt
+        (
+            _context_tokens,
+            context_mask,
+            context_ids,
+            context_tensor,
+        ) = encode_prompts(
+            prompts=prompts,
+            text_model=pipe.encoder,
+            text_tokenizer=pipe.tokenizer,
+            text_tokenizer_max_length=max_tokens,
+            system_prompt=llm_system_prompt,
+            use_llm_system_prompt=llm,
+        )
+        return context_mask, context_ids, context_tensor
+
+    def seed(self, seed: int):
+        import random
+        from transformers import set_seed
+        if seed == -1:
+            seed = random.randint(0, np.iinfo(np.int32).max)
+        set_seed(seed)
+        return seed
+
+    def generate(self,
+                 context_tensor,
+                 context_ids,
+                 context_mask,
+                 guidance: float = 4.5,
+                 smooth: bool = True,
+                 iterations: int = 1,
+                 top_k: int = 600,
+                 top_p: float = 0,
+                 seed: int = -1,
+                ):
+        seed = self.seed(seed)
+        samples = pipe.model.autoregressive_infer_cfg(
+            B=context_tensor.size(0), # batch size comes from number of prompts
+            label_B=context_tensor,
+            top_k=top_k,
+            top_p=top_p,
+            cfg=guidance,
+            g_seed=seed,
+            num_maskgit_iters=iterations,
+            more_smooth=smooth,
+            context_position_ids=context_ids,
+            context_mask=context_mask,
+        )
+        return samples
+
+    def sample(self, samples: torch.Tensor):
+        from PIL import Image
+        samples = (255 * samples.float().cpu().numpy()).clip(0, 255).astype(np.uint8).transpose(0, 2, 3, 1)
+        images = [Image.fromarray(sample) for sample in samples]
+        return images
+
+
+def mem():
+    torch.cuda.empty_cache()
+    free, total = torch.cuda.mem_get_info()
+    used = round((total - free) / 1024 / 1024)
+    return used
+
+
 def generate(
     prompt: str,
     seed: int = 0,
-    # width: int = 1024,
-    # height: int = 1024,
-    guidance_scale: float = 4.5,
-    randomize_seed: bool = False,
+    guidance: float = 4.5,
+    smooth: bool = True,
+    llm: bool = True,
+    iterations: int = 1,
+    top_k: int = 600,
+    top_p: float = 0,
+    max_tokens: int = 300,
     progress=gr.Progress(track_tqdm=True),
 ):
-    global text_model, text_tokenizer
-    # pipe.to(device)
-    seed = int(randomize_seed_fn(seed, randomize_seed))
-    generator = torch.Generator().manual_seed(seed)
-
-    if safety_check.is_dangerous(
-        safety_checker_tokenizer, safety_checker_model, prompt
-    ):
-        prompt = "A red heart."
-
-    prompts = [prompt]
-
-    with torch.inference_mode():
-        with torch.autocast(
-            "cuda", enabled=True, dtype=torch.float16, cache_enabled=True
-        ):
-
-            (
-                context_tokens,
-                context_mask,
-                context_position_ids,
-                context_tensor,
-            ) = encode_prompts(
-                prompts,
-                text_model,
-                text_tokenizer,
-                args.max_token_length,
-                llm_system_prompt,
-                args.use_llm_system_prompt,
-            )
-
-            infer_func = model.autoregressive_infer_cfg
-
-            output_imgs = infer_func(
-                B=context_tensor.size(0),
-                label_B=context_tensor,
-                cfg=args.cfg,
-                g_seed=seed,
-                more_smooth=args.more_smooth,
-                context_position_ids=context_position_ids,
-                context_mask=context_mask,
-            )
-
-    # bs, 3, r, r
-    images = []
-    sample_imgs_np = output_imgs.clone().mul_(255).cpu().numpy()
-    num_imgs = sample_imgs_np.shape[0]
-    for img_idx in range(num_imgs):
-        cur_img = sample_imgs_np[img_idx]
-        cur_img = cur_img.transpose(1, 2, 0).astype(np.uint8)
-        cur_img_store = Image.fromarray(cur_img)
-        images.append(cur_img_store)
-
-    return images, seed
+    global pipe
+    if pipe is None:
+        pprint('loading...')
+        t0 = time.time()
+        pipe = HARTPipeline()
+        t1 = time.time()
+        pprint(f'load: model="{pipe.model_path}" cls={pipe.model.__class__.__name__} encoder="{pipe.encoder_path}" cls={pipe.encoder.__class__.__name__} device={pipe.device} dtype={pipe.dtype} memory={mem()} time={t1-t0:.3f}')
+    pprint(f'generate: seed={seed} guidance={guidance} smooth={smooth} llm={llm} iterations={iterations} top_k={top_k} top_p={top_p} max_tokens={max_tokens} prompt="{prompt}" ')
+    with torch.inference_mode(), torch.autocast("cuda", enabled=True, dtype=pipe.dtype, cache_enabled=False):
+        t0 = time.time()
+        context_mask, context_ids, context_tensor = pipe.encode(
+            prompt,
+            max_tokens,
+            llm,
+        )
+        t1 = time.time()
+        samples = pipe.generate(
+            context_tensor=context_tensor,
+            context_ids=context_ids,
+            context_mask=context_mask,
+            guidance=guidance,
+            smooth=smooth,
+            iterations=iterations,
+            top_k=top_k,
+            top_p=top_p,
+            seed=seed,
+        )
+        t2 = time.time()
+        images = pipe.sample(samples)
+    pprint(f'harp: encode={t1-t0:.3f} generate={t2-t1:.3f} images: {images} memory={mem()}')
+    return images
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument(
-        "--model_path",
-        type=str,
-        help="The path to HART model.",
-        default="pretrained_models/HART-1024",
-    )
-    parser.add_argument(
-        "--text_model_path",
-        type=str,
-        help="The path to text model, we employ Qwen2-VL-1.5B-Instruct by default.",
-        default="Qwen2-VL-1.5B-Instruct",
-    )
-    parser.add_argument(
-        "--shield_model_path",
-        type=str,
-        help="The path to shield model, we employ ShieldGemma-2B by default.",
-        default="google/shieldgemma-2b",
-    )
-    parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--use_ema", type=bool, default=True)
-    parser.add_argument("--max_token_length", type=int, default=300)
-    parser.add_argument("--use_llm_system_prompt", type=bool, default=True)
-    parser.add_argument(
-        "--cfg", type=float, help="Classifier-free guidance scale.", default=4.5
-    )
-    parser.add_argument(
-        "--more_smooth",
-        type=bool,
-        help="Turn on for more visually smooth samples.",
-        default=True,
-    )
-    args = parser.parse_args()
-
-    model = AutoModel.from_pretrained(args.model_path, torch_dtype=torch.float16)
-    model = model.to(device)
-    model.eval()
-
-    if args.use_ema:
-        model.load_state_dict(
-            torch.load(os.path.join(args.model_path, "ema_model.bin"))
-        )
-
-    text_tokenizer = AutoTokenizer.from_pretrained(args.text_model_path)
-    text_model = AutoModel.from_pretrained(
-        args.text_model_path, torch_dtype=torch.float16
-    ).to(device)
-    text_model.eval()
-    text_tokenizer_max_length = args.max_token_length
-
-    safety_checker_tokenizer = AutoTokenizer.from_pretrained(args.shield_model_path)
-    safety_checker_model = AutoModelForCausalLM.from_pretrained(
-        args.shield_model_path,
-        device_map="auto",
-        torch_dtype=torch.bfloat16,
-    ).to(device)
-
-    examples = [
-        "melting apple",
-        "neon holography crystal cat",
-        "A dog that has been meditating all the time",
-        "An astronaut riding a horse on the moon, oil painting by Van Gogh.",
-        "8k uhd A man looks up at the starry sky, lonely and ethereal, Minimalism, Chaotic composition Op Art",
-        "Full body shot, a French woman, Photography, French Streets background, backlighting, rim light, Fujifilm.",
-        "Steampunk makeup, in the style of vray tracing, colorful impasto, uhd image, indonesian art, fine feather details with bright red and yellow and green and pink and orange colours, intricate patterns and details, dark cyan and amber makeup. Rich colourful plumes. Victorian style.",
-    ]
-
-    css = """
-    .gradio-container{max-width: 560px !important}
-    h1{text-align:center}
-    """
-    with gr.Blocks(css=css) as demo:
-        gr.Markdown(DESCRIPTION)
-        gr.DuplicateButton(
-            value="Duplicate Space for private use",
-            elem_id="duplicate-button",
-            visible=os.getenv("SHOW_DUPLICATE_BUTTON") == "1",
-        )
+    mem()
+    with gr.Blocks() as demo:
         with gr.Group():
-            with gr.Row():
-                prompt = gr.Text(
-                    label="Prompt",
-                    show_label=False,
-                    max_lines=1,
-                    placeholder="Enter your prompt",
-                    container=False,
-                )
-                run_button = gr.Button("Run", scale=0)
-
-            result = gr.Gallery(
-                label="Result",
-                columns=NUM_IMAGES_PER_PROMPT,
-                show_label=False,
-                # height=800,
-            )
-            with gr.Accordion("Advanced options", open=False):
-                seed = gr.Slider(
-                    label="Seed",
-                    minimum=0,
-                    maximum=MAX_SEED,
-                    step=1,
-                    value=args.seed,
-                )
-                randomize_seed = gr.Checkbox(label="Randomize seed", value=True)
+            with gr.Column(scale=1):
                 with gr.Row():
-                    guidance_scale = gr.Slider(
-                        label="Guidance Scale",
-                        minimum=0.1,
-                        maximum=20,
-                        step=0.1,
-                        value=4.5,
-                    )
-
-        gr.Examples(
-            examples=examples,
-            inputs=prompt,
-            outputs=[result, seed],
-            fn=generate,
-            cache_examples=CACHE_EXAMPLES,
-        )
-
+                    prompt = gr.Text(label="Prompt", show_label=False, max_lines=2, placeholder="prompt", container=False)
+                    run_button = gr.Button("Run", scale=0)
+                with gr.Row():
+                    smooth = gr.Checkbox(label="Smoother output", value=True)
+                    llm = gr.Checkbox(label="Prompt enhancer", value=True)
+                with gr.Row():
+                    seed = gr.Number(label="Seed", minimum=-1, maximum=np.iinfo(np.int32).max, step=1, value=-1)
+                    top_k = gr.Number(label="Top-K", minimum=0, maximum=2000, step=1, value=600)
+                    top_p = gr.Number(label="Top-P", minimum=0, maximum=1, step=0.01, value=0)
+                    guidance = gr.Slider(label="Guidance Scale", minimum=0.1, maximum=20, step=0.1, value=4.5)
+                    iterations = gr.Slider(label="Iterations", minimum=1, maximum=99, step=1, value=1)
+            with gr.Column(scale=4):
+                with gr.Row():
+                    result = gr.Gallery(label="Result", columns=1, show_label=False)
         gr.on(
-            triggers=[
-                prompt.submit,
-                run_button.click,
-            ],
+            triggers=[prompt.submit, run_button.click],
             fn=generate,
-            inputs=[
-                prompt,
-                seed,
-                guidance_scale,
-                randomize_seed,
-            ],
-            outputs=[result, seed],
+            inputs=[prompt, seed, guidance, smooth, llm, iterations, top_k, top_p], 
+            outputs=[result],
             api_name="run",
         )
-
-    demo.queue(max_size=20).launch(share=True)
+    demo.queue(max_size=20).launch()
