@@ -20,3 +20,5 @@ Credits: [Paper](https://arxiv.org/abs/2410.10812) | [Project Page](https://hanl
 source venv/bin/activate
 python app.py
 ```
+
+![image](https://github.com/user-attachments/assets/7d8f47b0-0119-47dd-aed2-eafab01593e6)
